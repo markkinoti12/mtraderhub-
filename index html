@@ -1,0 +1,171 @@
+# mtraderhub-<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veytrix Tradershub</title>
+<style>
+  :root{--bg:#0e1117;--card:#171b24;--line:#262c3a;--tx:#e8eaf0;--mut:#8b93a7;--red:#ff444f;--grn:#2ecc71}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,sans-serif;padding:16px;max-width:520px;margin:auto}
+  h1{font-size:20px;margin:0 0 12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+  button{background:var(--red);color:#fff;border:0;border-radius:8px;padding:12px;font-size:15px;width:100%;cursor:pointer}
+  button.g{background:var(--grn)} button.s{background:#2a3142}
+  select,input{width:100%;padding:10px;margin:4px 0 10px;background:#0e1117;color:var(--tx);border:1px solid var(--line);border-radius:8px;font-size:15px}
+  label{font-size:12px;color:var(--mut)}
+  .row{display:flex;gap:8px}.row>*{flex:1}
+  .price{font-size:30px;font-weight:700}
+  .mut{color:var(--mut);font-size:13px}
+  pre{background:#0e1117;padding:8px;border-radius:8px;max-height:160px;overflow:auto;font-size:11px;white-space:pre-wrap}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<h1>Veytrix Tradershub</h1>
+
+<div id="login" class="card">
+  <p class="mut">Log in with your Deriv account to trade.</p>
+  <button onclick="login()">Log in with Deriv</button>
+</div>
+
+<div id="app" class="hide">
+  <div class="card">
+    <label>Account</label>
+    <select id="acct" onchange="connect()"></select>
+    <div class="mut">Balance: <b id="bal">-</b></div>
+    <button class="s" style="margin-top:10px" onclick="logout()">Log out</button>
+  </div>
+
+  <div class="card">
+    <label>Market (symbol)</label>
+    <select id="sym" onchange="subTicks()">
+      <option value="R_10">Volatility 10</option>
+      <option value="R_25">Volatility 25</option>
+      <option value="R_50">Volatility 50</option>
+      <option value="R_75">Volatility 75</option>
+      <option value="R_100" selected>Volatility 100</option>
+    </select>
+    <div class="price" id="price">-</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div><label>Stake</label><input id="stake" type="number" value="1" min="0.35" step="0.01"></div>
+      <div><label>Ticks</label><input id="dur" type="number" value="5" min="1" max="10"></div>
+    </div>
+    <div class="row">
+      <button class="g" onclick="trade('CALL')">Rise</button>
+      <button onclick="trade('PUT')">Fall</button>
+    </div>
+    <p class="mut" id="msg"></p>
+  </div>
+
+  <div class="card"><label>Log</label><pre id="log"></pre></div>
+</div>
+
+<script>
+// ====== CONFIG ======
+const APP_ID = "34ztJqByy1oElH26jAEfi";
+const REDIRECT_URI = "https://mttradershub.site";
+const AUTH_URL = "https://auth.deriv.com/oauth2/auth";
+const TOKEN_URL = "https://auth.deriv.com/oauth2/token";
+const API = "https://api.derivws.com";
+const SCOPE = "trade account_manage"; // adjust to scopes enabled on your app
+// ====================
+
+const $ = id => document.getElementById(id);
+const log = m => { $("log").textContent = (typeof m==="string"?m:JSON.stringify(m)) + "\n" + $("log").textContent; };
+let ws = null, accounts = [], pending = {};
+
+// ---- PKCE helpers ----
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+const rand = n => b64url(crypto.getRandomValues(new Uint8Array(n)));
+async function challenge(v){ return b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(v))); }
+
+async function login(){
+  const verifier = rand(48), state = rand(16);
+  sessionStorage.setItem("pkce_verifier", verifier);
+  sessionStorage.setItem("pkce_state", state);
+  const p = new URLSearchParams({
+    response_type:"code", client_id:APP_ID, redirect_uri:REDIRECT_URI,
+    scope:SCOPE, state, code_challenge:await challenge(verifier), code_challenge_method:"S256"
+  });
+  location.href = AUTH_URL + "?" + p;
+}
+
+async function handleCallback(){
+  const q = new URLSearchParams(location.search);
+  if(!q.get("code")) return false;
+  if(q.get("state") !== sessionStorage.getItem("pkce_state")){ alert("State mismatch"); return false; }
+  const body = new URLSearchParams({
+    grant_type:"authorization_code", client_id:APP_ID, code:q.get("code"),
+    code_verifier:sessionStorage.getItem("pkce_verifier"), redirect_uri:REDIRECT_URI
+  });
+  const r = await fetch(TOKEN_URL, {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body});
+  const j = await r.json();
+  if(!j.access_token){ alert("Login failed: " + JSON.stringify(j)); return false; }
+  sessionStorage.setItem("access_token", j.access_token);
+  sessionStorage.removeItem("pkce_verifier"); sessionStorage.removeItem("pkce_state");
+  history.replaceState({}, "", "/");
+  return true;
+}
+
+function logout(){ sessionStorage.clear(); if(ws) ws.close(); location.href="/"; }
+
+const headers = () => ({"Deriv-App-ID":APP_ID, "Authorization":"Bearer "+sessionStorage.getItem("access_token")});
+
+async function loadAccounts(){
+  const r = await fetch(API+"/trading/v1/options/accounts", {headers:headers()});
+  const j = await r.json(); log(j);
+  accounts = j.data || [];
+  $("acct").innerHTML = accounts.map(a =>
+    `<option value="${a.account_id}">${a.account_id} (${a.account_type||""} ${a.currency||""})</option>`).join("");
+}
+
+async function connect(){
+  if(ws) ws.close();
+  const id = $("acct").value; if(!id) return;
+  const r = await fetch(`${API}/trading/v1/options/accounts/${id}/otp`, {method:"POST", headers:headers()});
+  const j = await r.json(); log("OTP ok: " + !!(j.data&&j.data.url));
+  if(!j.data) return;
+  ws = new WebSocket(j.data.url);
+  ws.onopen = () => { send({balance:1, subscribe:1}); subTicks(); };
+  ws.onmessage = e => onMsg(JSON.parse(e.data));
+  ws.onclose = () => log("socket closed");
+}
+
+let reqId = 1;
+function send(o){ o.req_id = reqId++; ws.send(JSON.stringify(o)); return o.req_id; }
+
+function onMsg(m){
+  if(m.error){ $("msg").textContent = m.error.message; log(m); return; }
+  if(m.msg_type==="balance") $("bal").textContent = m.balance.balance + " " + m.balance.currency;
+  else if(m.msg_type==="tick") $("price").textContent = m.tick.quote;
+  else if(m.msg_type==="proposal"){
+    send({buy:m.proposal.id, price:+$("stake").value});
+    $("msg").textContent = "Proposal: payout " + m.proposal.payout;
+  }
+  else if(m.msg_type==="buy") $("msg").textContent = "Bought. Contract " + m.buy.contract_id;
+  log(m.msg_type);
+}
+
+function subTicks(){ if(ws&&ws.readyState===1){ send({forget_all:"ticks"}); send({ticks:$("sym").value, subscribe:1}); } }
+
+function trade(type){
+  $("msg").textContent = "Requesting...";
+  send({proposal:1, amount:+$("stake").value, basis:"stake", contract_type:type,
+        currency:(accounts.find(a=>a.account_id===$("acct").value)||{}).currency||"USD",
+        duration:+$("dur").value, duration_unit:"t", symbol:$("sym").value});
+}
+
+(async () => {
+  if(location.search.includes("code=")) await handleCallback();
+  if(sessionStorage.getItem("access_token")){
+    $("login").classList.add("hide"); $("app").classList.remove("hide");
+    try{ await loadAccounts(); await connect(); }catch(e){ log(String(e)); }
+  }
+})();
+</script>
+</body>
+</html>
